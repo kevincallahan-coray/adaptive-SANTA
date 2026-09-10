@@ -1,0 +1,67 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: santa-ruler-8k-adaptive-a1
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      initContainers:
+      - name: clone
+        image: alpine/git
+        command: ["sh","-c"]
+        args:
+          - git clone --depth 1 REPLACE_WITH_YOUR_REPO_URL /repo
+        volumeMounts:
+        - name: repo
+          mountPath: /repo
+      containers:
+      - name: run
+        image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+        command: ["bash","-lc"]
+        args:
+          - |
+            set -euo pipefail
+            cd /repo
+            python -m pip install -q -r requirements.txt
+            nvidia-smi
+            python benchmark_jsonl.py \
+              --dataset /work/data/ruler/qa_1_8192.jsonl \
+              --output /work/results/qa_1_8k_adaptive_a1.jsonl \
+              --mode adaptive --alpha 1.0 \
+              --max-input-tokens 8192 --max-examples 25 --max-new-tokens 64
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: token
+        - name: HF_HOME
+          value: /work/hf
+        resources:
+          requests:
+            cpu: "4"
+            memory: 32Gi
+            nvidia.com/a40: "1"
+          limits:
+            cpu: "8"
+            memory: 48Gi
+            nvidia.com/a40: "1"
+        volumeMounts:
+        - name: repo
+          mountPath: /repo
+        - name: work
+          mountPath: /work
+        - name: dshm
+          mountPath: /dev/shm
+      volumes:
+      - name: repo
+        emptyDir: {}
+      - name: work
+        persistentVolumeClaim:
+          claimName: santa-work
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 8Gi

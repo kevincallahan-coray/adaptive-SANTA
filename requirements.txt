@@ -1,0 +1,5 @@
+transformers>=5.6,<6
+accelerate>=1.8
+huggingface_hub>=0.34
+tqdm>=4.67
+pandas>=2.2
