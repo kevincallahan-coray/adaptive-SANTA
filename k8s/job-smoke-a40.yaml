@@ -12,7 +12,7 @@ spec:
         image: alpine/git
         command: ["sh","-c"]
         args:
-          - git clone --depth 1 REPLACE_WITH_YOUR_REPO_URL /repo
+          - git clone --depth 1 https://github.com/kevincallahan-coray/adaptive-SANTA.git /repo
         volumeMounts:
         - name: repo
           mountPath: /repo
@@ -24,7 +24,9 @@ spec:
           - |
             set -euo pipefail
             cd /repo
+            python -m pip install -q --upgrade torch --index-url https://download.pytorch.org/whl/cu128
             python -m pip install -q -r requirements.txt
+            python -c "import torch; print('torch:', torch.__version__, 'cuda:', torch.version.cuda, 'gpu:', torch.cuda.get_device_name())"
             nvidia-smi
             python smoke.py --mode dense
             python smoke.py --mode fixed --fixed-s 128
