@@ -150,3 +150,7 @@ For the current 4-task, 100-example parallel RULER sweep with the 50 GiB shared 
 ```bat
 scripts\run-ruler-parallel100.bat
 ```
+
+### RULER data prerequisites
+
+The parallel RULER preparation job automatically downloads the Paul Graham essay corpus and the SQuAD/HotpotQA source files required by `niah_multivalue`, `qa_1`, and `qa_2`. Failed/stale generated task directories are cleared before regeneration, and each task must contain exactly 100 rows before the GPU jobs launch.

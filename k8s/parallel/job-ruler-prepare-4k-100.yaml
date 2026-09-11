@@ -34,17 +34,35 @@ spec:
             - |
               set -euo pipefail
               apt-get update -qq
-              apt-get install -y -qq git ca-certificates >/dev/null
+              apt-get install -y -qq git ca-certificates wget >/dev/null
+
               python -m venv /tmp/ruler-venv
               source /tmp/ruler-venv/bin/activate
               python -m pip install -q --upgrade pip
               python -m pip install -q \
                 "numpy<2" "scipy>=1.11,<1.14" "transformers==4.44.2" "huggingface_hub==0.23.4" \
-                nltk wonderwords tqdm pyyaml tenacity sentencepiece
+                nltk wonderwords tqdm pyyaml tenacity sentencepiece beautifulsoup4 html2text
 
               git clone --depth 1 https://github.com/NVIDIA/RULER.git /tmp/RULER
+
+              echo "=== Downloading RULER auxiliary datasets ==="
+              cd /tmp/RULER/scripts/data/synthetic/json
+              python download_paulgraham_essay.py
+              test -s PaulGrahamEssays.json
+              bash download_qa_dataset.sh
+              test -s squad.json
+              test -s hotpotqa.json
+              ls -lh PaulGrahamEssays.json squad.json hotpotqa.json
+
               SAVE=/shared/ruler/data/4096_100
               cd /tmp/RULER/scripts/data
+
+              # Never accept stale output from an earlier failed preparation run.
+              rm -rf \
+                "$SAVE/fwe" \
+                "$SAVE/niah_multivalue" \
+                "$SAVE/qa_1" \
+                "$SAVE/qa_2"
 
               for TASK in fwe niah_multivalue qa_1 qa_2; do
                 echo "=== Preparing ${TASK} ==="
@@ -58,8 +76,15 @@ spec:
                   --model_template_type meta-llama3 \
                   --num_samples 100 \
                   --random_seed 42
-                test -f "$SAVE/$TASK/validation.jsonl"
-                wc -l "$SAVE/$TASK/validation.jsonl"
+
+                FILE="$SAVE/$TASK/validation.jsonl"
+                test -s "$FILE"
+                LINES=$(wc -l < "$FILE")
+                echo "$TASK lines: $LINES"
+                if [ "$LINES" -ne 100 ]; then
+                  echo "ERROR: expected 100 rows for $TASK but found $LINES" >&2
+                  exit 1
+                fi
               done
 
               echo "=== Shared dataset files ==="

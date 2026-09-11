@@ -83,3 +83,9 @@ scripts\download-ruler-results.bat
 ```
 
 This creates a temporary read-only CPU pod and downloads `ruler-results.tar.gz` to the repo directory.
+
+## RULER auxiliary data note
+
+The RULER repository does not ship the generated `PaulGrahamEssays.json`, `squad.json`, or `hotpotqa.json` files. The preparation Job now runs RULER's own download scripts before generating the four tasks. It also removes any stale task output from a previously failed preparation run and requires exactly 100 rows per task before the GPU jobs are launched.
+
+The message from Transformers saying that PyTorch/TensorFlow/Flax is unavailable during the CPU-only preparation job is expected; that job only needs the Hugging Face tokenizer, not a model runtime.
