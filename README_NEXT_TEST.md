@@ -85,3 +85,9 @@ dense,fixed32,fixed64,fixed128,fixed256,adaptive0.5,adaptive1,adaptive2,adaptive
 Then increase to 25 examples and add `niah_multivalue`, `qa_1`, and `qa_2`, followed by 8192-token datasets.
 
 The RULER scorer in this package mirrors the benchmark's simple substring metrics for the four tasks we care about: `string_match_all` for FWE/NIAH and `string_match_part` for QA.
+
+## Storage-permission fix in this revision
+
+The RULER preparation and benchmark Jobs now set `fsGroup: 1000` and run a small root init container that creates `/work/data` and `/work/results` with group-write permission. This addresses the PVC `Permission denied` failure. The benchmark also performs a write test before starting Python.
+
+`scipy>=1.11,<1.14` is now pinned in `requirements.txt` alongside `numpy<2`, so the isolated virtual environment installs a compatible SciPy explicitly.

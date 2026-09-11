@@ -7,6 +7,26 @@ spec:
   template:
     spec:
       restartPolicy: Never
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      initContainers:
+        - name: fix-work-permissions
+          image: busybox:1.36
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              chgrp 1000 /work || true
+              chmod g+rwx /work || true
+              mkdir -p /work/data/ruler /work/results
+              chgrp -R 1000 /work/data /work/results
+              chmod -R g+rwX /work/data /work/results
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: work
+              mountPath: /work
       containers:
         - name: prepare
           image: python:3.11-slim
@@ -20,9 +40,10 @@ spec:
               source /tmp/ruler-venv/bin/activate
               python -m pip install -q --upgrade pip
               python -m pip install -q \
-                "numpy<2" "transformers==4.44.2" "huggingface_hub==0.23.4" \
-                nltk wonderwords tqdm pyyaml tenacity sentencepiece scipy
+                "numpy<2" "scipy>=1.11,<1.14" "transformers==4.44.2" "huggingface_hub==0.23.4" \
+                nltk wonderwords tqdm pyyaml tenacity sentencepiece
 
+              mkdir -p /tmp/hf
               git clone --depth 1 https://github.com/NVIDIA/RULER.git /tmp/RULER
               mkdir -p /work/data/ruler/4096
               touch /work/data/ruler/.write_test
