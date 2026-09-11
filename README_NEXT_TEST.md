@@ -38,7 +38,7 @@ The check compares final-token logits, next-token argmax, and a short greedy gen
 
 ## 2. Generate the first RULER dataset
 
-This first test intentionally uses the simple NVIDIA/RULER `main` data generator so we can validate the experiment with minimal infrastructure. It creates 10 FWE examples at 4096 tokens on the `santa-work` PVC.
+This first test intentionally uses the simple NVIDIA/RULER `main` data generator so we can validate the experiment with minimal infrastructure. It creates 10 FWE examples at 4096 tokens on the `kevin-workspace` PVC.
 
 ```powershell
 kubectl delete job ruler-prepare-4k-fwe --ignore-not-found
@@ -49,7 +49,7 @@ kubectl logs -f job/ruler-prepare-4k-fwe
 Expected final output includes:
 
 ```text
-10 /work/data/ruler/4096/fwe/validation.jsonl
+10 /work/santa-adaptive-z/data/ruler/4096/fwe/validation.jsonl
 ```
 
 ## 3. Run the first RULER comparison
@@ -69,7 +69,7 @@ The first run intentionally uses only:
 on the same 10 examples. The job writes:
 
 ```text
-/work/results/ruler_4096_fwe/summary.csv
+/work/santa-adaptive-z/results/ruler_4096_fwe/summary.csv
 ```
 
 and prints that CSV at the end of the log.
@@ -88,6 +88,6 @@ The RULER scorer in this package mirrors the benchmark's simple substring metric
 
 ## Storage-permission fix in this revision
 
-The RULER preparation and benchmark Jobs now set `fsGroup: 1000` and run a small root init container that creates `/work/data` and `/work/results` with group-write permission. This addresses the PVC `Permission denied` failure. The benchmark also performs a write test before starting Python.
+The RULER preparation and benchmark Jobs now set `fsGroup: 1000` and run a small root init container that creates `/work/santa-adaptive-z/data` and `/work/santa-adaptive-z/results` with group-write permission. This addresses the PVC `Permission denied` failure. The benchmark also performs a write test before starting Python.
 
 `scipy>=1.11,<1.14` is now pinned in `requirements.txt` alongside `numpy<2`, so the isolated virtual environment installs a compatible SciPy explicitly.

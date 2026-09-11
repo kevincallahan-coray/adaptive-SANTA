@@ -1,7 +1,10 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: santa-work
+  name: kevin-workspace
+  labels:
+    app.kubernetes.io/name: adaptive-santa
+    app.kubernetes.io/part-of: kevin-workspace
 spec:
   storageClassName: rook-ceph-block
   accessModes:

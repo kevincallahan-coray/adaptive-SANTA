@@ -39,11 +39,11 @@ unset HF_TOKEN
 
 ```bash
 kubectl apply -f k8s/pvc.yaml
-kubectl get pvc santa-work
+kubectl get pvc kevin-workspace
 ```
 
 Wait for `Bound`. This uses 100 GiB `rook-ceph-block` / ReadWriteOnce storage.
-It is ideal for a single job at a time and caches the model at `/work/hf`.
+It is ideal for a single job at a time and caches the model at `/work/santa-adaptive-z/hf`.
 
 ## 4. Smoke test
 
@@ -68,7 +68,7 @@ kubectl apply -f k8s/job-smoke-a40.yaml
 
 The benchmark runner accepts JSONL rows with at least `input` (or `prompt`).
 The NVIDIA RULER format and the SANTA tutorial format both use JSONL and can be
-adapted easily. Put generated/evaluation data under `/work/data/ruler`.
+adapted easily. Put generated/evaluation data under `/work/santa-adaptive-z/data/ruler`.
 
 If you have the exact JSONLs used in the SANTA paper, prefer those. Otherwise,
 generate RULER v1 data and begin with the four paper-relevant tasks:
@@ -83,7 +83,7 @@ full 32k evaluation until fixed-S behavior has been validated.
 
 ## 6. Run an 8k job
 
-Place (for example) `/work/data/ruler/qa_1_8192.jsonl` on the PVC, edit the repo
+Place (for example) `/work/santa-adaptive-z/data/ruler/qa_1_8192.jsonl` on the PVC, edit the repo
 URL, and run:
 
 ```bash
@@ -91,7 +91,7 @@ kubectl apply -f k8s/job-ruler-8k-a40.yaml
 kubectl logs -f job/santa-ruler-8k-adaptive-a1
 ```
 
-Results are written to `/work/results` on the PVC.
+Results are written to `/work/santa-adaptive-z/results` on the PVC.
 
 For the initial matrix, run these **serially** with the block PVC:
 
@@ -138,3 +138,7 @@ kubectl delete job JOB_NAME
 
 If a job is Pending, inspect Events at the bottom of `kubectl describe pod`.
 Common causes are GPU quota/type availability or storage/node locality.
+
+## Kevin workspace layout
+
+The current NRP setup uses the `kevin-workspace` RBD PVC and keeps this experiment under `/work/santa-adaptive-z`. See `WORKSPACE_AND_SWEEP.md` for migration, interactive inspection, and the 50-example FWE sweep.

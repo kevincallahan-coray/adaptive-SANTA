@@ -27,9 +27,9 @@ spec:
               set -eu
               chgrp 1000 /work || true
               chmod g+rwx /work || true
-              mkdir -p /work/data/ruler /work/results
-              chgrp -R 1000 /work/data /work/results
-              chmod -R g+rwX /work/data /work/results
+              mkdir -p /work/santa-adaptive-z/data/ruler /work/santa-adaptive-z/results /work/santa-adaptive-z/hf
+              chgrp -R 1000 /work/santa-adaptive-z/data /work/santa-adaptive-z/results /work/santa-adaptive-z/hf
+              chmod -R g+rwX /work/santa-adaptive-z/data /work/santa-adaptive-z/results /work/santa-adaptive-z/hf
           securityContext:
             runAsUser: 0
           volumeMounts:
@@ -51,34 +51,34 @@ spec:
             - |
               set -euo pipefail
               cd /repo
-              test -f /work/data/ruler/4096/fwe/validation.jsonl
-              mkdir -p /work/results/ruler_4096_fwe
+              test -f /work/santa-adaptive-z/data/ruler/4096/fwe/validation.jsonl
+              mkdir -p /work/santa-adaptive-z/results/ruler_4096_fwe
 
               echo "=== storage permission check ==="
               id
-              ls -ld /work /work/data /work/results
-              touch /work/results/.write_test
-              rm /work/results/.write_test
+              ls -ld /work /work/santa-adaptive-z/data /work/santa-adaptive-z/results
+              touch /work/santa-adaptive-z/results/.write_test
+              rm /work/santa-adaptive-z/results/.write_test
 
               python -m venv /tmp/santa-venv
               source /tmp/santa-venv/bin/activate
               python -m pip install -q --upgrade pip
               python -m pip install -q torch --index-url https://download.pytorch.org/whl/cu128
               python -m pip install -q -r requirements.txt
-              mkdir -p /tmp/hf
+              mkdir -p /work/santa-adaptive-z/hf
 
               python -c "import torch, numpy, scipy; print('torch:', torch.__version__, 'numpy:', numpy.__version__, 'scipy:', scipy.__version__, 'gpu:', torch.cuda.get_device_name())"
 
               python ruler_matrix.py \
-                --dataset /work/data/ruler/4096/fwe/validation.jsonl \
+                --dataset /work/santa-adaptive-z/data/ruler/4096/fwe/validation.jsonl \
                 --task fwe \
-                --output-dir /work/results/ruler_4096_fwe \
+                --output-dir /work/santa-adaptive-z/results/ruler_4096_fwe \
                 --max-input-tokens 4096 \
                 --max-examples 10 \
                 --methods dense,fixed128,adaptive1
 
               echo "=== summary.csv ==="
-              cat /work/results/ruler_4096_fwe/summary.csv
+              cat /work/santa-adaptive-z/results/ruler_4096_fwe/summary.csv
           env:
             - name: HF_TOKEN
               valueFrom:
@@ -86,9 +86,9 @@ spec:
                   name: hf-token
                   key: token
             - name: HF_HOME
-              value: /tmp/hf
+              value: /work/santa-adaptive-z/hf
             - name: TRANSFORMERS_CACHE
-              value: /tmp/hf
+              value: /work/santa-adaptive-z/hf
           resources:
             requests:
               cpu: "2"
@@ -110,7 +110,7 @@ spec:
           emptyDir: {}
         - name: work
           persistentVolumeClaim:
-            claimName: santa-work
+            claimName: kevin-workspace
         - name: dshm
           emptyDir:
             medium: Memory

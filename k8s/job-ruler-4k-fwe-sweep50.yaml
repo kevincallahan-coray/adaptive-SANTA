@@ -1,13 +1,16 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: santa-smoke
+  name: santa-ruler-4k-fwe-sweep50
 spec:
-  backoffLimit: 2
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 86400
   template:
     spec:
       restartPolicy: Never
-
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -15,10 +18,22 @@ spec:
               - matchExpressions:
                   - key: nvidia.com/gpu.memory
                     operator: Gt
-                    values:
-                      - "20000"
-
+                    values: ["20000"]
       initContainers:
+        - name: fix-work-permissions
+          image: busybox:1.36
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              mkdir -p /work/santa-adaptive-z/data/ruler /work/santa-adaptive-z/results /work/santa-adaptive-z/hf
+              chgrp -R 1000 /work/santa-adaptive-z
+              chmod -R g+rwX /work/santa-adaptive-z
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: work
+              mountPath: /work
         - name: clone
           image: alpine/git
           command: ["sh", "-c"]
@@ -27,7 +42,6 @@ spec:
           volumeMounts:
             - name: repo
               mountPath: /repo
-
       containers:
         - name: run
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
@@ -36,25 +50,30 @@ spec:
             - |
               set -euo pipefail
               cd /repo
+              DATA=/work/santa-adaptive-z/data/ruler/4096_50/fwe/validation.jsonl
+              OUT=/work/santa-adaptive-z/results/ruler_4096_fwe_50
+              test -f "$DATA"
+              mkdir -p "$OUT"
 
               python -m venv /tmp/santa-venv
               source /tmp/santa-venv/bin/activate
-
               python -m pip install -q --upgrade pip
               python -m pip install -q torch --index-url https://download.pytorch.org/whl/cu128
-              python -m pip install -q "numpy<2" -r requirements.txt
+              python -m pip install -q -r requirements.txt
 
-              python -c "import torch, numpy; print('torch:', torch.__version__, 'numpy:', numpy.__version__, 'cuda:', torch.version.cuda, 'gpu:', torch.cuda.get_device_name())"
+              python -c "import torch, numpy, scipy; print('torch:', torch.__version__, 'numpy:', numpy.__version__, 'scipy:', scipy.__version__, 'gpu:', torch.cuda.get_device_name())"
               nvidia-smi
 
-              mkdir -p /work/santa-adaptive-z/hf
-              id
-              ls -ld /work/santa-adaptive-z/hf
+              python ruler_matrix.py \
+                --dataset "$DATA" \
+                --task fwe \
+                --output-dir "$OUT" \
+                --max-input-tokens 4096 \
+                --max-examples 50 \
+                --methods dense,fixed8,fixed16,fixed32,fixed64,fixed128,fixed256,adaptive0.5,adaptive1,adaptive2,adaptive4,adaptive8,adaptive16,adaptive32
 
-              python smoke.py --mode dense
-              python smoke.py --mode fixed --fixed-s 128
-              python smoke.py --mode adaptive --alpha 1.0
-
+              echo "=== summary.csv ==="
+              cat "$OUT/summary.csv"
           env:
             - name: HF_TOKEN
               valueFrom:
@@ -65,7 +84,6 @@ spec:
               value: /work/santa-adaptive-z/hf
             - name: TRANSFORMERS_CACHE
               value: /work/santa-adaptive-z/hf
-
           resources:
             requests:
               cpu: "2"
@@ -75,7 +93,6 @@ spec:
               cpu: "4"
               memory: 32Gi
               nvidia.com/gpu: "1"
-
           volumeMounts:
             - name: repo
               mountPath: /repo
@@ -83,7 +100,6 @@ spec:
               mountPath: /work
             - name: dshm
               mountPath: /dev/shm
-
       volumes:
         - name: repo
           emptyDir: {}

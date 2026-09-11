@@ -13,7 +13,7 @@ from ruler_metrics import score_records
 from santa_backend import CONTROLLER, register_backend
 
 TASK_TOKENS = {"fwe": 50, "niah_multivalue": 128, "qa_1": 32, "qa_2": 32}
-DEFAULT_METHODS = "dense,fixed32,fixed64,fixed128,fixed256,adaptive0.5,adaptive1,adaptive2,adaptive4"
+DEFAULT_METHODS = "dense,fixed8,fixed16,fixed32,fixed64,fixed128,fixed256,adaptive0.5,adaptive1,adaptive2,adaptive4,adaptive8,adaptive16,adaptive32"
 
 
 def parse_args():

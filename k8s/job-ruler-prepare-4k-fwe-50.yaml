@@ -1,9 +1,10 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: ruler-prepare-4k-fwe
+  name: ruler-prepare-4k-fwe-50
 spec:
   backoffLimit: 1
+  ttlSecondsAfterFinished: 86400
   template:
     spec:
       restartPolicy: Never
@@ -17,11 +18,9 @@ spec:
           args:
             - |
               set -eu
-              chgrp 1000 /work || true
-              chmod g+rwx /work || true
               mkdir -p /work/santa-adaptive-z/data/ruler /work/santa-adaptive-z/results /work/santa-adaptive-z/hf
-              chgrp -R 1000 /work/santa-adaptive-z/data /work/santa-adaptive-z/results /work/santa-adaptive-z/hf
-              chmod -R g+rwX /work/santa-adaptive-z/data /work/santa-adaptive-z/results /work/santa-adaptive-z/hf
+              chgrp -R 1000 /work/santa-adaptive-z
+              chmod -R g+rwX /work/santa-adaptive-z
           securityContext:
             runAsUser: 0
           volumeMounts:
@@ -43,26 +42,24 @@ spec:
                 "numpy<2" "scipy>=1.11,<1.14" "transformers==4.44.2" "huggingface_hub==0.23.4" \
                 nltk wonderwords tqdm pyyaml tenacity sentencepiece
 
-              mkdir -p /work/santa-adaptive-z/hf
               git clone --depth 1 https://github.com/NVIDIA/RULER.git /tmp/RULER
-              mkdir -p /work/santa-adaptive-z/data/ruler/4096
-              touch /work/santa-adaptive-z/data/ruler/.write_test
+              mkdir -p /work/santa-adaptive-z/data/ruler/4096_50
 
               cd /tmp/RULER/scripts/data
               python prepare.py \
-                --save_dir /work/santa-adaptive-z/data/ruler/4096 \
+                --save_dir /work/santa-adaptive-z/data/ruler/4096_50 \
                 --benchmark synthetic \
                 --task fwe \
                 --tokenizer_path meta-llama/Meta-Llama-3.1-8B-Instruct \
                 --tokenizer_type hf \
                 --max_seq_length 4096 \
                 --model_template_type meta-llama3 \
-                --num_samples 10 \
+                --num_samples 50 \
                 --random_seed 42
 
               echo "Generated:"
-              wc -l /work/santa-adaptive-z/data/ruler/4096/fwe/validation.jsonl
-              ls -lh /work/santa-adaptive-z/data/ruler/4096/fwe/validation.jsonl
+              wc -l /work/santa-adaptive-z/data/ruler/4096_50/fwe/validation.jsonl
+              ls -lh /work/santa-adaptive-z/data/ruler/4096_50/fwe/validation.jsonl
           env:
             - name: HF_TOKEN
               valueFrom:

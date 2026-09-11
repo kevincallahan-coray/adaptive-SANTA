@@ -36,9 +36,9 @@ spec:
               name: hf-token
               key: token
         - name: HF_HOME
-          value: /work/hf
+          value: /work/santa-adaptive-z/hf
         - name: TRANSFORMERS_CACHE
-          value: /work/hf
+          value: /work/santa-adaptive-z/hf
         resources:
           requests:
             cpu: "4"
@@ -60,7 +60,7 @@ spec:
         emptyDir: {}
       - name: work
         persistentVolumeClaim:
-          claimName: santa-work
+          claimName: kevin-workspace
       - name: dshm
         emptyDir:
           medium: Memory

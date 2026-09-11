@@ -1,0 +1,64 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: santa-migrate-workspace
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: busybox:1.36
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              PROJECT=/new/santa-adaptive-z
+              mkdir -p "$PROJECT/data" "$PROJECT/results" "$PROJECT/hf"
+
+              echo "=== old workspace ==="
+              ls -lah /old || true
+
+              for d in data results hf; do
+                if [ -e "/old/$d" ]; then
+                  echo "Copying /old/$d -> $PROJECT/$d"
+                  rm -rf "$PROJECT/$d"
+                  cp -a "/old/$d" "$PROJECT/$d"
+                fi
+              done
+
+              # Keep the workspace writable by the normal uid/gid used by the jobs.
+              chgrp -R 1000 "$PROJECT" || true
+              chmod -R g+rwX "$PROJECT" || true
+
+              echo "=== migrated workspace ==="
+              find "$PROJECT" -maxdepth 3 -type f | sort | head -200
+              echo "=== sizes ==="
+              du -sh /old/data /old/results /old/hf 2>/dev/null || true
+              du -sh "$PROJECT/data" "$PROJECT/results" "$PROJECT/hf" 2>/dev/null || true
+              echo "MIGRATION COMPLETE"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: old-work
+              mountPath: /old
+              readOnly: true
+            - name: new-work
+              mountPath: /new
+      volumes:
+        - name: old-work
+          persistentVolumeClaim:
+            claimName: santa-work
+            readOnly: true
+        - name: new-work
+          persistentVolumeClaim:
+            claimName: kevin-workspace
