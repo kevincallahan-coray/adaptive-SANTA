@@ -43,3 +43,13 @@ kubectl get jobs,pods -o wide
 The script only deletes/recreates jobs whose names end in `starve100`; it does not touch the original jobs. Each add-on job checks that its existing dataset file is present before starting the model run.
 
 The existing `scripts\download-ruler-results.bat` downloads the entire `/shared/ruler/results` tree, including both the original and starvation result directories.
+
+## Old Tesla/Pascal GPU compatibility
+
+The GPU jobs now require `nvidia.com/gpu.compute.major > 6` in addition to more than 20 GB of VRAM. This excludes Pascal-era GPUs such as Tesla P40 that cannot execute kernels from the current PyTorch/CUDA wheel, while retaining Volta/Turing/Ampere/Ada-class GPUs.
+
+If only the FWE starvation job failed, rerun just that job without touching the others:
+
+```bat
+scripts\rerun-fwe-starvation100.bat
+```
