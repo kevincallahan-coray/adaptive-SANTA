@@ -26,6 +26,8 @@ def parse_args():
     p.add_argument("--output-dir", required=True)
     p.add_argument("--model", default="meta-llama/Meta-Llama-3.1-8B-Instruct")
     p.add_argument("--methods", default=DEFAULT_METHODS)
+    p.add_argument("--candidates", default="8,16,32,64,128,256",
+                   help="Comma-separated allowed S values used by fixed/adaptive sampling")
     p.add_argument("--max-examples", type=int, default=10)
     p.add_argument("--max-input-tokens", type=int, default=4096)
     p.add_argument("--max-new-tokens", type=int, default=None)
@@ -46,6 +48,13 @@ def parse_method(name):
         alpha = float(name[len("adaptive"):])
         return name, "adaptive", alpha, None
     raise ValueError(f"Unknown method: {name}")
+
+
+def parse_candidates(text):
+    values = tuple(sorted({int(x.strip()) for x in text.split(",") if x.strip()}))
+    if not values or any(x <= 0 for x in values):
+        raise ValueError("--candidates must contain positive integers")
+    return values
 
 
 def make_prompt(rec):
@@ -141,6 +150,7 @@ class ZDistribution:
 
 def main():
     args = parse_args()
+    candidates = parse_candidates(args.candidates)
     out_dir = pathlib.Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -168,7 +178,7 @@ def main():
             mode,
             alpha=1.0 if alpha is None else alpha,
             fixed_s=128 if fixed_s is None else fixed_s,
-            candidates=(8, 16, 32, 64, 128, 256),
+            candidates=candidates,
             seed=args.seed,
         )
 
@@ -216,6 +226,7 @@ def main():
                     "alpha": alpha,
                     "fixed_s": fixed_s,
                     "seed": args.seed,
+                    "candidates": list(candidates),
                     "prompt_tokens": n,
                     "seconds": dt,
                     "santa_stats": stats,
@@ -235,6 +246,9 @@ def main():
             "mode": mode,
             "alpha": alpha,
             "fixed_s": fixed_s,
+            "candidates": ",".join(str(x) for x in candidates),
+            "candidate_min": min(candidates),
+            "candidate_max": max(candidates),
             "examples": len(rows),
             "score": round(score, 4),
             "mean_S": mean_s,

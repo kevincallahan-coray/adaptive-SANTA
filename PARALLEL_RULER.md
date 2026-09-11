@@ -89,3 +89,13 @@ This creates a temporary read-only CPU pod and downloads `ruler-results.tar.gz` 
 The RULER repository does not ship the generated `PaulGrahamEssays.json`, `squad.json`, or `hotpotqa.json` files. The preparation Job now runs RULER's own download scripts before generating the four tasks. It also removes any stale task output from a previously failed preparation run and requires exactly 100 rows per task before the GPU jobs are launched.
 
 The message from Transformers saying that PyTorch/TensorFlow/Flax is unavailable during the CPU-only preparation job is expected; that job only needs the Hugging Face tokenizer, not a model runtime.
+
+## Starvation add-on while the main sweep is still running
+
+To probe the low-sample regime without touching the currently running jobs, use:
+
+```bat
+scripts\run-ruler-starvation100.bat
+```
+
+This launches four additional jobs on the same prepared 4K/100 datasets. They run only `fixed1`, `fixed2`, `fixed4`, and adaptive `alpha={0.5,1,2,4}` with allowed sample counts `1,2,4,8,16,32,64,128,256`. Results go under `/shared/ruler/results/4096_100_starve/`, so they do not overwrite the main sweep.
