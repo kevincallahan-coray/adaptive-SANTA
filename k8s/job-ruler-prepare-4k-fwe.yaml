@@ -1,0 +1,66 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruler-prepare-4k-fwe
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: prepare
+          image: python:3.11-slim
+          command: ["bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              apt-get update -qq
+              apt-get install -y -qq git ca-certificates >/dev/null
+              python -m venv /tmp/ruler-venv
+              source /tmp/ruler-venv/bin/activate
+              python -m pip install -q --upgrade pip
+              python -m pip install -q \
+                "numpy<2" "transformers==4.44.2" "huggingface_hub==0.23.4" \
+                nltk wonderwords tqdm pyyaml tenacity sentencepiece
+
+              git clone --depth 1 https://github.com/NVIDIA/RULER.git /tmp/RULER
+              mkdir -p /work/data/ruler/4096
+              touch /work/data/ruler/.write_test
+
+              cd /tmp/RULER/scripts/data
+              python prepare.py \
+                --save_dir /work/data/ruler/4096 \
+                --benchmark synthetic \
+                --task fwe \
+                --tokenizer_path meta-llama/Meta-Llama-3.1-8B-Instruct \
+                --tokenizer_type hf \
+                --max_seq_length 4096 \
+                --model_template_type meta-llama3 \
+                --num_samples 10 \
+                --random_seed 42
+
+              echo "Generated:"
+              wc -l /work/data/ruler/4096/fwe/validation.jsonl
+              ls -lh /work/data/ruler/4096/fwe/validation.jsonl
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+            - name: HF_HOME
+              value: /tmp/hf
+          resources:
+            requests:
+              cpu: "2"
+              memory: 8Gi
+            limits:
+              cpu: "4"
+              memory: 16Gi
+          volumeMounts:
+            - name: work
+              mountPath: /work
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: santa-work

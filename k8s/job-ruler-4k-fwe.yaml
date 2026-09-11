@@ -1,0 +1,90 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: santa-ruler-4k-fwe
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.memory
+                    operator: Gt
+                    values: ["20000"]
+      initContainers:
+        - name: clone
+          image: alpine/git
+          command: ["sh", "-c"]
+          args:
+            - git clone --depth 1 https://github.com/kevincallahan-coray/adaptive-SANTA.git /repo
+          volumeMounts:
+            - name: repo
+              mountPath: /repo
+      containers:
+        - name: run
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command: ["bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              cd /repo
+              test -f /work/data/ruler/4096/fwe/validation.jsonl
+              mkdir -p /work/results/ruler_4096_fwe
+
+              python -m venv /tmp/santa-venv
+              source /tmp/santa-venv/bin/activate
+              python -m pip install -q --upgrade pip
+              python -m pip install -q torch --index-url https://download.pytorch.org/whl/cu128
+              python -m pip install -q -r requirements.txt
+              mkdir -p /tmp/hf
+
+              python ruler_matrix.py \
+                --dataset /work/data/ruler/4096/fwe/validation.jsonl \
+                --task fwe \
+                --output-dir /work/results/ruler_4096_fwe \
+                --max-input-tokens 4096 \
+                --max-examples 10 \
+                --methods dense,fixed128,adaptive1
+
+              echo "=== summary.csv ==="
+              cat /work/results/ruler_4096_fwe/summary.csv
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+            - name: HF_HOME
+              value: /tmp/hf
+            - name: TRANSFORMERS_CACHE
+              value: /tmp/hf
+          resources:
+            requests:
+              cpu: "2"
+              memory: 24Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4"
+              memory: 32Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: repo
+              mountPath: /repo
+            - name: work
+              mountPath: /work
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: repo
+          emptyDir: {}
+        - name: work
+          persistentVolumeClaim:
+            claimName: santa-work
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
