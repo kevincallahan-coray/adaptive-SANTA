@@ -21,7 +21,7 @@ spec:
               python -m pip install -q --upgrade pip
               python -m pip install -q \
                 "numpy<2" "transformers==4.44.2" "huggingface_hub==0.23.4" \
-                nltk wonderwords tqdm pyyaml tenacity sentencepiece
+                nltk wonderwords tqdm pyyaml tenacity sentencepiece scipy
 
               git clone --depth 1 https://github.com/NVIDIA/RULER.git /tmp/RULER
               mkdir -p /work/data/ruler/4096
