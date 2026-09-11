@@ -16,7 +16,7 @@ Python environments are still created under `/tmp`, not on the PVC. Only model c
 From Windows PowerShell, from the repo root:
 
 ```powershell
-.\scripts\migrate-workspace.ps1
+.\scripts\migrate-workspace.bat
 ```
 
 The script:
@@ -31,7 +31,7 @@ The explicit confirmation is intentional because deleting a PVC destroys the old
 ## 2. Inspect the workspace interactively
 
 ```powershell
-.\scripts\open-workspace-shell.ps1
+.\scripts\open-workspace-shell.bat
 ```
 
 Inside the pod:
@@ -54,7 +54,7 @@ No GPU is requested by the shell pod.
 Commit/push this repo first because the GPU Job clones the GitHub repo. Then:
 
 ```powershell
-.\scripts\run-fwe-sweep50.ps1
+.\scripts\run-fwe-sweep50.bat
 kubectl logs -f job/santa-ruler-4k-fwe-sweep50
 ```
 
