@@ -142,3 +142,11 @@ Common causes are GPU quota/type availability or storage/node locality.
 ## Kevin workspace layout
 
 The current NRP setup uses the `kevin-workspace` RBD PVC and keeps this experiment under `/work/santa-adaptive-z`. See `WORKSPACE_AND_SWEEP.md` for migration, interactive inspection, and the 50-example FWE sweep.
+
+## Parallel RULER experiment
+
+For the current 4-task, 100-example parallel RULER sweep with the 50 GiB shared CephFS volume, see `PARALLEL_RULER.md` and run:
+
+```bat
+scripts\run-ruler-parallel100.bat
+```

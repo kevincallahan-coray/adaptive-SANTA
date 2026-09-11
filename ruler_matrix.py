@@ -1,11 +1,13 @@
 import argparse
 import csv
 import json
+import math
 import os
 import pathlib
 import time
 from collections import Counter
 
+import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -14,6 +16,7 @@ from santa_backend import CONTROLLER, register_backend
 
 TASK_TOKENS = {"fwe": 50, "niah_multivalue": 128, "qa_1": 32, "qa_2": 32}
 DEFAULT_METHODS = "dense,fixed8,fixed16,fixed32,fixed64,fixed128,fixed256,adaptive0.5,adaptive1,adaptive2,adaptive4,adaptive8,adaptive16,adaptive32"
+Z_PERCENTILES = (10, 25, 50, 75, 90, 95, 99)
 
 
 def parse_args():
@@ -27,6 +30,8 @@ def parse_args():
     p.add_argument("--max-input-tokens", type=int, default=4096)
     p.add_argument("--max-new-tokens", type=int, default=None)
     p.add_argument("--seed", type=int, default=1690)
+    p.add_argument("--z-sample-cap", type=int, default=200000,
+                   help="Maximum Z observations retained per method for percentile/raw-distribution analysis")
     return p.parse_args()
 
 
@@ -62,16 +67,76 @@ def tokenize_prompt(tok, prompt, max_input_tokens):
     return {k: v.cuda() for k, v in enc.items()}, n
 
 
-def aggregate_stats(total_hist, total_heads, total_z_sum, total_z_count, stats):
-    hist = Counter({int(k): int(v) for k, v in stats.get("S_hist", {}).items()})
-    total_hist.update(hist)
-    n = int(stats.get("sampled_head_queries") or 0)
-    total_heads += n
-    mean_z = stats.get("mean_Z")
-    if mean_z is not None and n:
-        total_z_sum += float(mean_z) * n
-        total_z_count += n
-    return total_heads, total_z_sum, total_z_count
+class ZDistribution:
+    """Exact moments plus a bounded, uniform reservoir used for percentiles."""
+    def __init__(self, cap: int, seed: int):
+        self.cap = max(0, int(cap))
+        self.rng = np.random.default_rng(seed)
+        self.count = 0
+        self.sum = 0.0
+        self.sumsq = 0.0
+        self.min = math.inf
+        self.max = -math.inf
+        self.reservoir = np.empty((0,), dtype=np.float32)
+        self._reservoir_keys = np.empty((0,), dtype=np.float64)
+
+    def update(self, stats, values):
+        n = int(stats.get("z_count") or 0)
+        if n:
+            self.count += n
+            self.sum += float(stats.get("z_sum") or 0.0)
+            self.sumsq += float(stats.get("z_sumsq") or 0.0)
+            self.min = min(self.min, float(stats["min_Z"]))
+            self.max = max(self.max, float(stats["max_Z"]))
+        if self.cap <= 0 or not values:
+            return
+
+        arr = np.asarray(values, dtype=np.float32)
+        # Assign every observation an independent random priority and retain the
+        # highest priorities. This is an exact uniform reservoir, vectorized by
+        # example so we do not loop over millions of Z values in Python.
+        keys = self.rng.random(arr.size)
+        combined_values = np.concatenate((self.reservoir, arr))
+        combined_keys = np.concatenate((self._reservoir_keys, keys))
+        if combined_values.size <= self.cap:
+            self.reservoir = combined_values
+            self._reservoir_keys = combined_keys
+            return
+        keep = np.argpartition(combined_keys, -self.cap)[-self.cap:]
+        self.reservoir = combined_values[keep]
+        self._reservoir_keys = combined_keys[keep]
+
+    def summary(self):
+        if self.count == 0:
+            out = {
+                "mean_Z": None, "std_Z": None, "min_Z": None, "max_Z": None,
+                "Z_count": 0, "Z_sample_count": 0,
+            }
+            out.update({f"Z_p{p}": None for p in Z_PERCENTILES})
+            return out
+        mean = self.sum / self.count
+        variance = max(0.0, self.sumsq / self.count - mean * mean)
+        out = {
+            "mean_Z": mean,
+            "std_Z": math.sqrt(variance),
+            "min_Z": self.min,
+            "max_Z": self.max,
+            "Z_count": self.count,
+            "Z_sample_count": int(self.reservoir.size),
+        }
+        if self.reservoir.size:
+            q = np.percentile(self.reservoir, Z_PERCENTILES)
+            out.update({f"Z_p{p}": float(v) for p, v in zip(Z_PERCENTILES, q)})
+        else:
+            out.update({f"Z_p{p}": None for p in Z_PERCENTILES})
+        return out
+
+    def save(self, path):
+        np.savez_compressed(
+            path,
+            z=self.reservoir.astype(np.float32, copy=False),
+            total_count=np.asarray([self.count], dtype=np.int64),
+        )
 
 
 def main():
@@ -97,7 +162,7 @@ def main():
     max_new_tokens = args.max_new_tokens or TASK_TOKENS[args.task]
     summaries = []
 
-    for method_text in args.methods.split(","):
+    for method_index, method_text in enumerate(args.methods.split(",")):
         method, mode, alpha, fixed_s = parse_method(method_text)
         CONTROLLER.configure(
             mode,
@@ -110,8 +175,7 @@ def main():
         rows = []
         total_hist = Counter()
         total_heads = 0
-        total_z_sum = 0.0
-        total_z_count = 0
+        zdist = ZDistribution(args.z_sample_cap, args.seed + 1000 * method_index)
         method_start = time.time()
         torch.cuda.reset_peak_memory_stats()
 
@@ -137,9 +201,11 @@ def main():
 
                 pred = tok.decode(out[0, n:], skip_special_tokens=True).strip()
                 stats = CONTROLLER.summary()
-                total_heads, total_z_sum, total_z_count = aggregate_stats(
-                    total_hist, total_heads, total_z_sum, total_z_count, stats
-                )
+                hist = Counter({int(k): int(v) for k, v in stats.get("S_hist", {}).items()})
+                total_hist.update(hist)
+                total_heads += int(stats.get("sampled_head_queries") or 0)
+                zdist.update(stats, CONTROLLER.z_values())
+
                 row = {
                     **rec,
                     "index": rec.get("index", i),
@@ -160,7 +226,9 @@ def main():
 
         score = score_records(rows, args.task)
         mean_s = (sum(s * c for s, c in total_hist.items()) / total_heads) if total_heads else None
-        mean_z = (total_z_sum / total_z_count) if total_z_count else None
+        zsummary = zdist.summary()
+        zdist.save(out_dir / f"{args.task}_{method}_z_samples.npz")
+
         summary = {
             "task": args.task,
             "method": method,
@@ -170,7 +238,7 @@ def main():
             "examples": len(rows),
             "score": round(score, 4),
             "mean_S": mean_s,
-            "mean_Z": mean_z,
+            **zsummary,
             "S_hist": json.dumps(dict(sorted(total_hist.items()))),
             "wall_seconds": round(time.time() - method_start, 3),
             "peak_gpu_gib": round(torch.cuda.max_memory_allocated() / (1024 ** 3), 3),

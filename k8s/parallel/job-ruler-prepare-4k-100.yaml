@@ -1,0 +1,88 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruler-prepare-4k-100
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      initContainers:
+        - name: prepare-shared-dirs
+          image: busybox:1.36
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              mkdir -p /shared/ruler/data/4096_100 /shared/ruler/results
+              chgrp -R 1000 /shared/ruler
+              chmod -R g+rwX /shared/ruler
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+      containers:
+        - name: prepare
+          image: python:3.11-slim
+          command: ["bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              apt-get update -qq
+              apt-get install -y -qq git ca-certificates >/dev/null
+              python -m venv /tmp/ruler-venv
+              source /tmp/ruler-venv/bin/activate
+              python -m pip install -q --upgrade pip
+              python -m pip install -q \
+                "numpy<2" "scipy>=1.11,<1.14" "transformers==4.44.2" "huggingface_hub==0.23.4" \
+                nltk wonderwords tqdm pyyaml tenacity sentencepiece
+
+              git clone --depth 1 https://github.com/NVIDIA/RULER.git /tmp/RULER
+              SAVE=/shared/ruler/data/4096_100
+              cd /tmp/RULER/scripts/data
+
+              for TASK in fwe niah_multivalue qa_1 qa_2; do
+                echo "=== Preparing ${TASK} ==="
+                python prepare.py \
+                  --save_dir "$SAVE" \
+                  --benchmark synthetic \
+                  --task "$TASK" \
+                  --tokenizer_path meta-llama/Meta-Llama-3.1-8B-Instruct \
+                  --tokenizer_type hf \
+                  --max_seq_length 4096 \
+                  --model_template_type meta-llama3 \
+                  --num_samples 100 \
+                  --random_seed 42
+                test -f "$SAVE/$TASK/validation.jsonl"
+                wc -l "$SAVE/$TASK/validation.jsonl"
+              done
+
+              echo "=== Shared dataset files ==="
+              find "$SAVE" -maxdepth 2 -type f -name '*.jsonl' -exec ls -lh {} \;
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+            - name: HF_HOME
+              value: /tmp/hf
+          resources:
+            requests:
+              cpu: "2"
+              memory: 8Gi
+            limits:
+              cpu: "4"
+              memory: 16Gi
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+      volumes:
+        - name: shared
+          persistentVolumeClaim:
+            claimName: kevin-ruler-shared

@@ -4,6 +4,7 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Sequence
 
+import math
 import torch
 
 
@@ -27,7 +28,13 @@ class SantaController:
         self.s_hist = Counter()
         self.sampled_head_queries = 0
         self.z_sum = 0.0
+        self.z_sumsq = 0.0
         self.z_count = 0
+        self.z_min = math.inf
+        self.z_max = -math.inf
+        # Per-example raw Z values. The benchmark runner consumes these after
+        # each generation and keeps only a bounded global sample for quantiles.
+        self._z_values: list[float] = []
 
     def configure(self, mode: str, *, alpha=None, fixed_s=None,
                   candidates: Sequence[int] | None = None, seed: int = 0):
@@ -54,12 +61,30 @@ class SantaController:
 
     def summary(self):
         n = self.sampled_head_queries
+        z_mean = (self.z_sum / self.z_count) if self.z_count else None
+        if self.z_count:
+            variance = max(0.0, self.z_sumsq / self.z_count - z_mean * z_mean)
+            z_std = math.sqrt(variance)
+            z_min = self.z_min
+            z_max = self.z_max
+        else:
+            z_std = z_min = z_max = None
         return {
             "sampled_head_queries": n,
             "mean_S": (sum(s*c for s,c in self.s_hist.items()) / n) if n else None,
             "S_hist": dict(sorted(self.s_hist.items())),
-            "mean_Z": (self.z_sum / self.z_count) if self.z_count else None,
+            "z_count": self.z_count,
+            "z_sum": self.z_sum,
+            "z_sumsq": self.z_sumsq,
+            "mean_Z": z_mean,
+            "std_Z": z_std,
+            "min_Z": z_min,
+            "max_Z": z_max,
         }
+
+    def z_values(self):
+        """Return the current example's Z observations as ordinary floats."""
+        return self._z_values
 
 
 CONTROLLER = SantaController()
@@ -141,8 +166,16 @@ def santa_attention_forward(module, query, key, value, attention_mask, scaling,
         CONTROLLER.s_hist[int(s)] += int(count)
         CONTROLLER.sampled_head_queries += int(count)
 
-    CONTROLLER.z_sum += float(z.sum().item())
-    CONTROLLER.z_count += int(z.numel())
+    # Move the very small [B,H,Q] Z tensor once per attention call. This gives
+    # exact moments/min/max and lets the runner construct bounded quantile samples.
+    z_cpu = z.detach().float().reshape(-1).cpu()
+    CONTROLLER.z_sum += float(z_cpu.sum().item())
+    CONTROLLER.z_sumsq += float((z_cpu * z_cpu).sum().item())
+    CONTROLLER.z_count += int(z_cpu.numel())
+    CONTROLLER.z_min = min(CONTROLLER.z_min, float(z_cpu.min().item()))
+    CONTROLLER.z_max = max(CONTROLLER.z_max, float(z_cpu.max().item()))
+    CONTROLLER._z_values.extend(z_cpu.tolist())
+
     return out_f.reshape(b,h,q,d).transpose(1,2).contiguous(), None
 
 
