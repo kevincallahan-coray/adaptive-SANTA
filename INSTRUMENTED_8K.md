@@ -53,7 +53,9 @@ kubectl logs -f job/santa-ruler-8k-fwe-instrumented100
 kubectl logs -f job/santa-ruler-8k-niah-multivalue-instrumented100
 ```
 
-The jobs require a GPU with more than 20 GB and compute capability major > 6, which excludes the older Tesla/Pascal nodes that failed with `cudaErrorNoKernelImageForDevice`.
+The jobs require a GPU with more than 20 GB and **compute capability major > 7 (Ampere or newer)**. This deliberately excludes both Pascal and Turing/TITAN RTX. The 8K BF16 prefill can otherwise fall back to a much more memory-hungry SDPA path on Turing, which can OOM on a 24 GiB TITAN RTX.
+
+The job also sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` and performs a BF16/compute-capability preflight before loading the model. The allocator setting is only a fragmentation safeguard; it does not make an actually-too-small GPU large enough.
 
 ## Storage
 

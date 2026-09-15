@@ -170,3 +170,7 @@ scripts\run-ruler-8k-instrumented100.bat
 
 Results are isolated under `/shared/ruler/results/8192_100_instrumented/` so
 existing 4K results are not overwritten.
+
+## 8K GPU requirement
+
+The instrumented 8K RULER jobs now require **Ampere or newer** (`nvidia.com/gpu.compute.major > 7`) with >20 GB VRAM. This avoids NVIDIA TITAN RTX/Turing nodes, where BF16 SDPA can take a memory-heavy fallback path and OOM at 8K. See `INSTRUMENTED_8K.md`.
