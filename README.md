@@ -154,3 +154,19 @@ scripts\run-ruler-parallel100.bat
 ### RULER data prerequisites
 
 The parallel RULER preparation job automatically downloads the Paul Graham essay corpus and the SQuAD/HotpotQA source files required by `niah_multivalue`, `qa_1`, and `qa_2`. Failed/stale generated task directories are cleared before regeneration, and each task must contain exactly 100 rows before the GPU jobs launch.
+
+## 8K instrumented RULER run
+
+The next long-context experiment is documented in `INSTRUMENTED_8K.md`.
+It runs 100-example 8K FWE and NIAH-multivalue jobs in parallel with a minimum
+S of 8 and adds logical V-row accesses, duplicate compression, `Q`, effective
+support, 0.5/0.25 threshold counters, and layer/head diagnostic logging.
+
+Launch from Windows with:
+
+```bat
+scripts\run-ruler-8k-instrumented100.bat
+```
+
+Results are isolated under `/shared/ruler/results/8192_100_instrumented/` so
+existing 4K results are not overwritten.

@@ -12,11 +12,11 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from ruler_metrics import score_records
-from santa_backend import CONTROLLER, register_backend
+from santa_backend import CONTROLLER, DIAGNOSTIC_COLUMNS, DIAGNOSTIC_INDEX, register_backend
 
 TASK_TOKENS = {"fwe": 50, "niah_multivalue": 128, "qa_1": 32, "qa_2": 32}
-DEFAULT_METHODS = "dense,fixed8,fixed16,fixed32,fixed64,fixed128,fixed256,adaptive0.5,adaptive1,adaptive2,adaptive4,adaptive8,adaptive16,adaptive32"
-Z_PERCENTILES = (10, 25, 50, 75, 90, 95, 99)
+DEFAULT_METHODS = "dense,fixed8,fixed16,fixed32,fixed64,fixed128,fixed256,adaptive4,adaptive8,adaptive16,adaptive32"
+PERCENTILES = (10, 25, 50, 75, 90, 95, 99)
 
 
 def parse_args():
@@ -32,8 +32,10 @@ def parse_args():
     p.add_argument("--max-input-tokens", type=int, default=4096)
     p.add_argument("--max-new-tokens", type=int, default=None)
     p.add_argument("--seed", type=int, default=1690)
+    p.add_argument("--diagnostic-sample-cap", type=int, default=None,
+                   help="Maximum synchronized attention-event rows retained per method")
     p.add_argument("--z-sample-cap", type=int, default=200000,
-                   help="Maximum Z observations retained per method for percentile/raw-distribution analysis")
+                   help="Backward-compatible alias used as diagnostic cap when --diagnostic-sample-cap is omitted")
     return p.parse_args()
 
 
@@ -76,38 +78,44 @@ def tokenize_prompt(tok, prompt, max_input_tokens):
     return {k: v.cuda() for k, v in enc.items()}, n
 
 
-class ZDistribution:
-    """Exact moments plus a bounded, uniform reservoir used for percentiles."""
+class DiagnosticDistribution:
+    """Exact moments plus one bounded synchronized reservoir of attention events."""
+
     def __init__(self, cap: int, seed: int):
         self.cap = max(0, int(cap))
         self.rng = np.random.default_rng(seed)
         self.count = 0
-        self.sum = 0.0
-        self.sumsq = 0.0
-        self.min = math.inf
-        self.max = -math.inf
-        self.reservoir = np.empty((0,), dtype=np.float32)
+        width = len(DIAGNOSTIC_COLUMNS)
+        self.sum = np.zeros((width,), dtype=np.float64)
+        self.sumsq = np.zeros((width,), dtype=np.float64)
+        self.min = np.full((width,), np.inf, dtype=np.float64)
+        self.max = np.full((width,), -np.inf, dtype=np.float64)
+        self.reservoir = np.empty((0, width), dtype=np.float32)
         self._reservoir_keys = np.empty((0,), dtype=np.float64)
 
-    def update(self, stats, values):
-        n = int(stats.get("z_count") or 0)
-        if n:
-            self.count += n
-            self.sum += float(stats.get("z_sum") or 0.0)
-            self.sumsq += float(stats.get("z_sumsq") or 0.0)
-            self.min = min(self.min, float(stats["min_Z"]))
-            self.max = max(self.max, float(stats["max_Z"]))
-        if self.cap <= 0 or not values:
+    def update(self, events):
+        if isinstance(events, torch.Tensor):
+            arr = events.numpy()
+        else:
+            arr = np.asarray(events, dtype=np.float32)
+        if arr.size == 0:
             return
+        if arr.ndim != 2 or arr.shape[1] != len(DIAGNOSTIC_COLUMNS):
+            raise ValueError(f"Unexpected diagnostics shape: {arr.shape}")
+        arr = arr.astype(np.float32, copy=False)
+        arr64 = arr.astype(np.float64, copy=False)
+        self.count += int(arr.shape[0])
+        self.sum += arr64.sum(axis=0)
+        self.sumsq += np.square(arr64).sum(axis=0)
+        self.min = np.minimum(self.min, arr64.min(axis=0))
+        self.max = np.maximum(self.max, arr64.max(axis=0))
 
-        arr = np.asarray(values, dtype=np.float32)
-        # Assign every observation an independent random priority and retain the
-        # highest priorities. This is an exact uniform reservoir, vectorized by
-        # example so we do not loop over millions of Z values in Python.
-        keys = self.rng.random(arr.size)
-        combined_values = np.concatenate((self.reservoir, arr))
+        if self.cap <= 0:
+            return
+        keys = self.rng.random(arr.shape[0])
+        combined_values = np.concatenate((self.reservoir, arr), axis=0)
         combined_keys = np.concatenate((self._reservoir_keys, keys))
-        if combined_values.size <= self.cap:
+        if combined_values.shape[0] <= self.cap:
             self.reservoir = combined_values
             self._reservoir_keys = combined_keys
             return
@@ -115,42 +123,109 @@ class ZDistribution:
         self.reservoir = combined_values[keep]
         self._reservoir_keys = combined_keys[keep]
 
-    def summary(self):
+    def _metric_summary(self, column: str, prefix: str):
+        idx = DIAGNOSTIC_INDEX[column]
         if self.count == 0:
             out = {
-                "mean_Z": None, "std_Z": None, "min_Z": None, "max_Z": None,
-                "Z_count": 0, "Z_sample_count": 0,
+                f"mean_{prefix}": None,
+                f"std_{prefix}": None,
+                f"min_{prefix}": None,
+                f"max_{prefix}": None,
             }
-            out.update({f"Z_p{p}": None for p in Z_PERCENTILES})
+            out.update({f"{prefix}_p{p}": None for p in PERCENTILES})
             return out
-        mean = self.sum / self.count
-        variance = max(0.0, self.sumsq / self.count - mean * mean)
+        mean = self.sum[idx] / self.count
+        variance = max(0.0, self.sumsq[idx] / self.count - mean * mean)
         out = {
-            "mean_Z": mean,
-            "std_Z": math.sqrt(variance),
-            "min_Z": self.min,
-            "max_Z": self.max,
-            "Z_count": self.count,
-            "Z_sample_count": int(self.reservoir.size),
+            f"mean_{prefix}": float(mean),
+            f"std_{prefix}": math.sqrt(variance),
+            f"min_{prefix}": float(self.min[idx]),
+            f"max_{prefix}": float(self.max[idx]),
         }
-        if self.reservoir.size:
-            q = np.percentile(self.reservoir, Z_PERCENTILES)
-            out.update({f"Z_p{p}": float(v) for p, v in zip(Z_PERCENTILES, q)})
+        if self.reservoir.shape[0]:
+            q = np.percentile(self.reservoir[:, idx], PERCENTILES)
+            out.update({f"{prefix}_p{p}": float(v) for p, v in zip(PERCENTILES, q)})
         else:
-            out.update({f"Z_p{p}": None for p in Z_PERCENTILES})
+            out.update({f"{prefix}_p{p}": None for p in PERCENTILES})
+        return out
+
+    def summary(self):
+        out = {
+            "diagnostic_event_count": self.count,
+            "diagnostic_sample_count": int(self.reservoir.shape[0]),
+            # Backward-compatible names used by the earlier 4K summaries.
+            "Z_count": self.count,
+            "Z_sample_count": int(self.reservoir.shape[0]),
+        }
+        if self.count == 0:
+            # Preserve the older Z field names for easy concatenation with 4K CSVs.
+            out.update(self._metric_summary("z", "Z"))
+            out.update(self._metric_summary("q", "Q"))
+            out.update(self._metric_summary("n_eff", "Neff"))
+            out.update(self._metric_summary("count_ge_0p5", "C05"))
+            out.update(self._metric_summary("count_ge_0p25", "C025"))
+            out.update(self._metric_summary("unique_rows", "U"))
+            out.update(self._metric_summary("duplicates", "duplicates"))
+            return out
+        out.update(self._metric_summary("z", "Z"))
+        out.update(self._metric_summary("q", "Q"))
+        out.update(self._metric_summary("n_eff", "Neff"))
+        out.update(self._metric_summary("count_ge_0p5", "C05"))
+        out.update(self._metric_summary("count_ge_0p25", "C025"))
+        out.update(self._metric_summary("unique_rows", "U"))
+        out.update(self._metric_summary("duplicates", "duplicates"))
         return out
 
     def save(self, path):
+        payload = {
+            name: self.reservoir[:, DIAGNOSTIC_INDEX[name]].astype(np.float32, copy=False)
+            for name in DIAGNOSTIC_COLUMNS
+        }
+        payload["total_count"] = np.asarray([self.count], dtype=np.int64)
+        payload["columns"] = np.asarray(DIAGNOSTIC_COLUMNS)
+        np.savez_compressed(path, **payload)
+
+    def save_z_compat(self, path):
         np.savez_compressed(
             path,
-            z=self.reservoir.astype(np.float32, copy=False),
+            z=self.reservoir[:, DIAGNOSTIC_INDEX["z"]].astype(np.float32, copy=False),
             total_count=np.asarray([self.count], dtype=np.int64),
         )
+
+    def save_layer_head_csv(self, path):
+        if self.reservoir.shape[0] == 0:
+            return
+        layer_idx = DIAGNOSTIC_INDEX["layer"]
+        head_idx = DIAGNOSTIC_INDEX["head"]
+        layer = self.reservoir[:, layer_idx].astype(np.int32)
+        head = self.reservoir[:, head_idx].astype(np.int32)
+        pairs = np.unique(np.stack((layer, head), axis=1), axis=0)
+        value_cols = [
+            "z", "q", "n_eff", "count_ge_0p5", "count_ge_0p25",
+            "selected_s", "unique_rows", "duplicates", "context_len",
+        ]
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            fieldnames = ["layer", "head", "sample_count"] + [f"mean_{c}" for c in value_cols]
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            for layer_id, head_id in pairs:
+                mask = (layer == layer_id) & (head == head_id)
+                row = {
+                    "layer": int(layer_id),
+                    "head": int(head_id),
+                    "sample_count": int(mask.sum()),
+                }
+                for col in value_cols:
+                    row[f"mean_{col}"] = float(self.reservoir[mask, DIAGNOSTIC_INDEX[col]].mean())
+                w.writerow(row)
 
 
 def main():
     args = parse_args()
     candidates = parse_candidates(args.candidates)
+    diagnostic_cap = args.diagnostic_sample_cap
+    if diagnostic_cap is None:
+        diagnostic_cap = args.z_sample_cap
     out_dir = pathlib.Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -184,8 +259,12 @@ def main():
 
         rows = []
         total_hist = Counter()
-        total_heads = 0
-        zdist = ZDistribution(args.z_sample_cap, args.seed + 1000 * method_index)
+        total_sampled_heads = 0
+        total_attention_heads = 0
+        total_samples = 0
+        total_logical_rows = 0
+        total_dense_rows = 0
+        diagnostics = DiagnosticDistribution(diagnostic_cap, args.seed + 1000 * method_index)
         method_start = time.time()
         torch.cuda.reset_peak_memory_stats()
 
@@ -213,8 +292,12 @@ def main():
                 stats = CONTROLLER.summary()
                 hist = Counter({int(k): int(v) for k, v in stats.get("S_hist", {}).items()})
                 total_hist.update(hist)
-                total_heads += int(stats.get("sampled_head_queries") or 0)
-                zdist.update(stats, CONTROLLER.z_values())
+                total_sampled_heads += int(stats.get("sampled_head_queries") or 0)
+                total_attention_heads += int(stats.get("attention_head_queries") or 0)
+                total_samples += int(stats.get("total_samples") or 0)
+                total_logical_rows += int(stats.get("logical_row_accesses") or 0)
+                total_dense_rows += int(stats.get("dense_equivalent_row_accesses") or 0)
+                diagnostics.update(CONTROLLER.consume_diagnostic_events())
 
                 row = {
                     **rec,
@@ -233,12 +316,24 @@ def main():
                 }
                 rows.append(row)
                 out_f.write(json.dumps(row) + "\n")
-                print(f"[{method} {i+1}/{len(data)}] tokens={n} sec={dt:.2f} pred={pred[:100]!r}", flush=True)
+                print(
+                    f"[{method} {i+1}/{len(data)}] tokens={n} sec={dt:.2f} "
+                    f"rows={stats.get('logical_row_accesses')} pred={pred[:100]!r}",
+                    flush=True,
+                )
 
         score = score_records(rows, args.task)
-        mean_s = (sum(s * c for s, c in total_hist.items()) / total_heads) if total_heads else None
-        zsummary = zdist.summary()
-        zdist.save(out_dir / f"{args.task}_{method}_z_samples.npz")
+        mean_s = (sum(s * c for s, c in total_hist.items()) / total_sampled_heads) if total_sampled_heads else None
+        mean_unique_rows = (total_logical_rows / total_attention_heads) if total_attention_heads else None
+        mean_context_rows = (total_dense_rows / total_attention_heads) if total_attention_heads else None
+        row_reduction = (total_dense_rows / total_logical_rows) if total_logical_rows else None
+        sample_to_row_ratio = (total_samples / total_logical_rows) if total_samples and total_logical_rows else None
+        duplicate_fraction = (1.0 - total_logical_rows / total_samples) if total_samples else None
+        diag_summary = diagnostics.summary()
+
+        diagnostics.save(out_dir / f"{args.task}_{method}_diagnostics.npz")
+        diagnostics.save_z_compat(out_dir / f"{args.task}_{method}_z_samples.npz")
+        diagnostics.save_layer_head_csv(out_dir / f"{args.task}_{method}_layer_head_sample.csv")
 
         summary = {
             "task": args.task,
@@ -252,7 +347,16 @@ def main():
             "examples": len(rows),
             "score": round(score, 4),
             "mean_S": mean_s,
-            **zsummary,
+            "attention_head_queries": total_attention_heads,
+            "total_samples": total_samples if total_sampled_heads else None,
+            "logical_row_accesses": total_logical_rows,
+            "dense_equivalent_row_accesses": total_dense_rows,
+            "mean_unique_rows": mean_unique_rows,
+            "mean_context_rows": mean_context_rows,
+            "row_reduction_vs_dense": row_reduction,
+            "sample_to_row_ratio": sample_to_row_ratio,
+            "duplicate_fraction": duplicate_fraction,
+            **diag_summary,
             "S_hist": json.dumps(dict(sorted(total_hist.items()))),
             "wall_seconds": round(time.time() - method_start, 3),
             "peak_gpu_gib": round(torch.cuda.max_memory_allocated() / (1024 ** 3), 3),

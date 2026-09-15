@@ -4,8 +4,26 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Sequence
 
-import math
 import torch
+
+
+# Every sampled head/query contributes one row with these fields.  The runner
+# keeps a bounded uniform reservoir, so layer/head analysis stays manageable
+# even for long-context RULER runs.
+DIAGNOSTIC_COLUMNS = (
+    "z",
+    "q",
+    "n_eff",
+    "count_ge_0p5",
+    "count_ge_0p25",
+    "selected_s",
+    "unique_rows",
+    "duplicates",
+    "layer",
+    "head",
+    "context_len",
+)
+DIAGNOSTIC_INDEX = {name: i for i, name in enumerate(DIAGNOSTIC_COLUMNS)}
 
 
 @dataclass
@@ -27,14 +45,17 @@ class SantaController:
     def reset_stats(self):
         self.s_hist = Counter()
         self.sampled_head_queries = 0
-        self.z_sum = 0.0
-        self.z_sumsq = 0.0
-        self.z_count = 0
-        self.z_min = math.inf
-        self.z_max = -math.inf
-        # Per-example raw Z values. The benchmark runner consumes these after
-        # each generation and keeps only a bounded global sample for quantiles.
-        self._z_values: list[float] = []
+        self.attention_head_queries = 0
+        self.total_samples = 0
+        # "logical_row_accesses" counts distinct sampled token indices within
+        # each attention head/query after duplicate compression.  It is a
+        # hardware-relevant logical V-row metric, not a claim about DRAM/cache
+        # transactions for a particular physical layout.
+        self.logical_row_accesses = 0
+        # Number of logical rows dense decode would read over the same
+        # head/query events: sum(context_len) for every head/query.
+        self.dense_equivalent_row_accesses = 0
+        self._diagnostic_chunks: list[torch.Tensor] = []
 
     def configure(self, mode: str, *, alpha=None, fixed_s=None,
                   candidates: Sequence[int] | None = None, seed: int = 0):
@@ -59,32 +80,53 @@ class SantaController:
             self._generators[key] = g
         return self._generators[key]
 
-    def summary(self):
-        n = self.sampled_head_queries
-        z_mean = (self.z_sum / self.z_count) if self.z_count else None
-        if self.z_count:
-            variance = max(0.0, self.z_sumsq / self.z_count - z_mean * z_mean)
-            z_std = math.sqrt(variance)
-            z_min = self.z_min
-            z_max = self.z_max
-        else:
-            z_std = z_min = z_max = None
-        return {
-            "sampled_head_queries": n,
-            "mean_S": (sum(s*c for s,c in self.s_hist.items()) / n) if n else None,
-            "S_hist": dict(sorted(self.s_hist.items())),
-            "z_count": self.z_count,
-            "z_sum": self.z_sum,
-            "z_sumsq": self.z_sumsq,
-            "mean_Z": z_mean,
-            "std_Z": z_std,
-            "min_Z": z_min,
-            "max_Z": z_max,
-        }
+    def record_dense_decode(self, query: torch.Tensor, key: torch.Tensor):
+        b, h, q, _ = query.shape
+        k = int(key.shape[-2])
+        n = int(b * h * q)
+        rows = n * k
+        self.attention_head_queries += n
+        self.logical_row_accesses += rows
+        self.dense_equivalent_row_accesses += rows
 
-    def z_values(self):
-        """Return the current example's Z observations as ordinary floats."""
-        return self._z_values
+    def record_sampled_events(self, diagnostics_cpu: torch.Tensor):
+        if diagnostics_cpu.ndim != 2 or diagnostics_cpu.shape[1] != len(DIAGNOSTIC_COLUMNS):
+            raise ValueError("Unexpected diagnostic tensor shape")
+        n = int(diagnostics_cpu.shape[0])
+        if n == 0:
+            return
+        self.attention_head_queries += n
+        self.total_samples += int(diagnostics_cpu[:, DIAGNOSTIC_INDEX["selected_s"]].sum().item())
+        self.logical_row_accesses += int(diagnostics_cpu[:, DIAGNOSTIC_INDEX["unique_rows"]].sum().item())
+        self.dense_equivalent_row_accesses += int(diagnostics_cpu[:, DIAGNOSTIC_INDEX["context_len"]].sum().item())
+        self._diagnostic_chunks.append(diagnostics_cpu)
+
+    def consume_diagnostic_events(self) -> torch.Tensor:
+        if not self._diagnostic_chunks:
+            return torch.empty((0, len(DIAGNOSTIC_COLUMNS)), dtype=torch.float32)
+        out = torch.cat(self._diagnostic_chunks, dim=0)
+        self._diagnostic_chunks = []
+        return out
+
+    def summary(self):
+        n = self.attention_head_queries
+        logical = self.logical_row_accesses
+        dense_rows = self.dense_equivalent_row_accesses
+        total_samples = self.total_samples
+        return {
+            "sampled_head_queries": self.sampled_head_queries,
+            "attention_head_queries": n,
+            "mean_S": (total_samples / self.sampled_head_queries) if self.sampled_head_queries else None,
+            "S_hist": dict(sorted(self.s_hist.items())),
+            "total_samples": total_samples if self.sampled_head_queries else None,
+            "logical_row_accesses": logical,
+            "dense_equivalent_row_accesses": dense_rows,
+            "mean_unique_rows": (logical / n) if n else None,
+            "mean_context_rows": (dense_rows / n) if n else None,
+            "row_reduction_vs_dense": (dense_rows / logical) if logical else None,
+            "sample_to_row_ratio": (total_samples / logical) if total_samples and logical else None,
+            "duplicate_fraction": (1.0 - logical / total_samples) if total_samples else None,
+        }
 
 
 CONTROLLER = SantaController()
@@ -117,7 +159,17 @@ def santa_attention_forward(module, query, key, value, attention_mask, scaling,
 
     cfg = CONTROLLER.config
     q_len = query.shape[-2]
-    if cfg.mode == "dense" or (cfg.sample_decode_only and q_len != 1):
+
+    # Prefill is always exact and is intentionally excluded from decode-only
+    # sampling/memory statistics.
+    if cfg.sample_decode_only and q_len != 1:
+        return sdpa_attention_forward(
+            module, query, key, value, attention_mask,
+            scaling=scaling, dropout=dropout, **kwargs
+        )
+
+    if cfg.mode == "dense":
+        CONTROLLER.record_dense_decode(query, key)
         return sdpa_attention_forward(
             module, query, key, value, attention_mask,
             scaling=scaling, dropout=dropout, **kwargs
@@ -136,8 +188,11 @@ def santa_attention_forward(module, query, key, value, attention_mask, scaling,
 
     scores32 = scores.float()
     max_score = scores32.max(dim=-1, keepdim=True).values
-    weights = torch.exp(scores32 - max_score)
+    weights = torch.exp(scores32 - max_score)       # w_i, max(w)=1
     z = weights.sum(dim=-1)                         # [B,H,Q]
+    q_stat = (weights * weights).sum(dim=-1)        # Q = sum_i w_i^2
+    count_ge_0p5 = (weights >= 0.5).sum(dim=-1)
+    count_ge_0p25 = (weights >= 0.25).sum(dim=-1)
     cdf = weights.cumsum(dim=-1)
     selected_s = _select_s(z)
 
@@ -146,9 +201,13 @@ def santa_attention_forward(module, query, key, value, attention_mask, scaling,
     n = b*h*q
     cdf_f = cdf.reshape(n, k).contiguous()
     z_f = z.reshape(n)
+    q_f = q_stat.reshape(n)
+    c05_f = count_ge_0p5.reshape(n)
+    c025_f = count_ge_0p25.reshape(n)
     s_f = selected_s.reshape(n)
     values_f = value_states.unsqueeze(2).expand(b,h,q,k,d).reshape(n,k,d)
     out_f = torch.empty((n,d), device=value_states.device, dtype=value_states.dtype)
+    unique_f = torch.empty((n,), device=weights.device, dtype=torch.long)
     gen = CONTROLLER.generator(weights.device)
 
     for s in cfg.candidates:
@@ -163,18 +222,40 @@ def santa_attention_forward(module, query, key, value, attention_mask, scaling,
         gather_idx = idx.unsqueeze(-1).expand(-1,-1,d)
         samples = torch.gather(values_f[rows], 1, gather_idx)
         out_f[rows] = samples.mean(dim=1)
+
+        # Thresholds are monotonically increasing, therefore searchsorted indices
+        # are nondecreasing and adjacent changes count distinct sampled V rows.
+        if s == 1:
+            unique = torch.ones((count,), device=weights.device, dtype=torch.long)
+        else:
+            unique = 1 + (idx[:, 1:] != idx[:, :-1]).sum(dim=1)
+        unique_f[rows] = unique
+
         CONTROLLER.s_hist[int(s)] += int(count)
         CONTROLLER.sampled_head_queries += int(count)
 
-    # Move the very small [B,H,Q] Z tensor once per attention call. This gives
-    # exact moments/min/max and lets the runner construct bounded quantile samples.
-    z_cpu = z.detach().float().reshape(-1).cpu()
-    CONTROLLER.z_sum += float(z_cpu.sum().item())
-    CONTROLLER.z_sumsq += float((z_cpu * z_cpu).sum().item())
-    CONTROLLER.z_count += int(z_cpu.numel())
-    CONTROLLER.z_min = min(CONTROLLER.z_min, float(z_cpu.min().item()))
-    CONTROLLER.z_max = max(CONTROLLER.z_max, float(z_cpu.max().item()))
-    CONTROLLER._z_values.extend(z_cpu.tolist())
+    n_eff_f = (z_f * z_f) / q_f.clamp_min(torch.finfo(torch.float32).tiny)
+    head_f = torch.arange(h, device=weights.device, dtype=torch.float32).view(1, h, 1)
+    head_f = head_f.expand(b, h, q).reshape(n)
+    layer_idx = float(getattr(module, "layer_idx", -1))
+
+    diagnostics = torch.stack(
+        [
+            z_f,
+            q_f,
+            n_eff_f,
+            c05_f.float(),
+            c025_f.float(),
+            s_f.float(),
+            unique_f.float(),
+            (s_f - unique_f).float(),
+            torch.full((n,), layer_idx, device=weights.device, dtype=torch.float32),
+            head_f,
+            torch.full((n,), float(k), device=weights.device, dtype=torch.float32),
+        ],
+        dim=1,
+    ).detach().cpu()
+    CONTROLLER.record_sampled_events(diagnostics)
 
     return out_f.reshape(b,h,q,d).transpose(1,2).contiguous(), None
 
