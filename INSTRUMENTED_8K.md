@@ -188,3 +188,12 @@ scripts\download-ruler-8k-instrumented.bat
 ```
 
 This creates `ruler-8k-instrumented.tar.gz` in the repository directory.
+
+## Follow-on: does the offset randomness matter?
+
+The sampler used here anchors its systematic grid at a random offset. A
+follow-on run on the same two tasks replaces that with a constant 0.5 and
+compares the two arms per example, separating the accuracy effect of the
+randomization from the accuracy effect of spreading draws over the CDF. It
+writes to `8192_100_midpoint/` and leaves this run's results untouched. See
+[MIDPOINT_OFFSET.md](MIDPOINT_OFFSET.md).

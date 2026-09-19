@@ -1,0 +1,194 @@
+# Midpoint-offset comparison, sized to actually get scheduled on a busy cluster.
+#
+# Same experiment as job-ruler-8k-{fwe,niah-multivalue}-midpoint100.yaml, with
+# every constraint that does not affect the result relaxed:
+#
+#   1. ONE GPU, not two. Both tasks run sequentially in this pod, so the
+#      cluster has to find one free card rather than two at the same moment.
+#      Each task writes its own output directory and finishes completely
+#      before the next starts, so a preemption costs at most one task.
+#   2. compute.major > 6 instead of > 7, which is what the 4K jobs in
+#      k8s/parallel already use. Turing comes back into the pool. The
+#      bfloat16 hazard that motivated > 7 is handled at runtime instead:
+#      ruler_matrix.py --dtype auto drops to float16 where bfloat16 is not
+#      native, which keeps SDPA off the memory-hungry fallback path.
+#   3. Host cpu/memory requests cut from 2/24Gi to 1/12Gi. The model lives on
+#      the GPU and loads with low_cpu_mem_usage; the old request was excluding
+#      otherwise-fine nodes on RAM it never used.
+#   4. A trimmed budget sweep by default (3 matched pairs, no dense), which
+#      cuts wall time by more than half and makes the job small enough to fit
+#      an opportunistic slot.
+#
+# What is NOT relaxed: the 20 GB VRAM floor. Llama-3.1-8B is ~16 GB of weights
+# before any KV cache, so a smaller card does not fit and would fail after the
+# queue rather than in it.
+#
+# Two honest caveats about float16, which only apply if this lands on Turing:
+#   - Both offset arms share one process and therefore one dtype, so the
+#      paired comparison this experiment exists for is unaffected.
+#   - The absolute scores are NOT comparable to the bfloat16 numbers from
+#      8192_100_instrumented. The pod log and every summary row record the
+#      dtype actually used, so this cannot be mixed up silently after the fact.
+#
+# Env knobs: SANTA_CTX (8192|4096), SANTA_SEED, SANTA_METHODS, SANTA_TASKS,
+# SANTA_DTYPE, SANTA_EXAMPLES.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: santa-ruler-midpoint100-8k
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.memory
+                    operator: Gt
+                    values: ["20000"]
+                  - key: nvidia.com/gpu.compute.major
+                    operator: Gt
+                    values: ["6"]
+      initContainers:
+        - name: clone
+          image: alpine/git
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -e
+              git clone --depth 1 https://github.com/kevincallahan-coray/adaptive-SANTA.git /repo
+              git -C /repo log -1 --format='cloned %h %ad %s' --date=short
+          volumeMounts:
+            - name: repo
+              mountPath: /repo
+      containers:
+        - name: run
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command: ["bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              cd /repo
+              CTX="${SANTA_CTX:-8192}"
+              SEED="${SANTA_SEED:-1690}"
+              TASKS="${SANTA_TASKS:-fwe niah_multivalue}"
+              DTYPE="${SANTA_DTYPE:-auto}"
+              EXAMPLES="${SANTA_EXAMPLES:-100}"
+              METHODS="${SANTA_METHODS:-fixed8,fixed8-mid,fixed32,fixed32-mid,fixed128,fixed128-mid}"
+
+              # Hardware check FIRST, before the multi-minute torch download, so
+              # a broken or unsuitable node costs seconds instead of minutes.
+              nvidia-smi
+              python - <<'PYGPU'
+              import subprocess, sys
+              print(subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total,driver_version",
+                                    "--format=csv,noheader"], capture_output=True, text=True).stdout)
+              PYGPU
+
+              echo "ctx=$CTX seed=$SEED dtype=$DTYPE tasks=$TASKS"
+              echo "methods=$METHODS"
+
+              python -m venv /tmp/santa-venv
+              source /tmp/santa-venv/bin/activate
+              python -m pip install -q --upgrade pip
+              python -m pip install -q torch --index-url https://download.pytorch.org/whl/cu128
+              python -m pip install -q -r requirements.txt
+
+              # Fail fast on a dead GPU or a checkout that predates the offset
+              # mode, and report what dtype this node will actually get.
+              python - <<'PYPRE'
+              import os, torch, santa_backend, ruler_matrix
+              torch.zeros(1).cuda()                      # surfaces CUDA init failure here
+              cc = torch.cuda.get_device_capability(0)
+              props = torch.cuda.get_device_properties(0)
+              chosen = ruler_matrix.resolve_dtype(os.environ.get("SANTA_DTYPE", "auto"))
+              print(f"GPU: {props.name}; compute={cc[0]}.{cc[1]}; "
+                    f"VRAM={props.total_memory/(1024**3):.1f} GiB; dtype={chosen}")
+              if not hasattr(santa_backend.SantaConfig(), "offset"):
+                  raise SystemExit("this checkout has no offset mode -- push your local changes and rerun")
+              assert ruler_matrix.parse_method("fixed64-mid")[4] == "midpoint"
+              ctx = int(os.environ.get("SANTA_CTX", "8192"))
+              if cc[0] < 8 and ctx > 4096 and os.environ.get("SANTA_ALLOW_TURING_LONG") != "1":
+                  raise SystemExit(
+                      f"compute {cc[0]}.{cc[1]} with ctx={ctx}: pre-Ampere at long context is the "
+                      "documented OOM case. Run with SANTA_CTX=4096, or set "
+                      "SANTA_ALLOW_TURING_LONG=1 to try it anyway.")
+              print("preflight ok")
+              PYPRE
+
+              for TASK in $TASKS; do
+                DATA=/shared/ruler/data/${CTX}_100/${TASK}/validation.jsonl
+                OUT=/shared/ruler/results/${CTX}_100_midpoint/${TASK}_seed${SEED}
+                if [ ! -f "$DATA" ]; then
+                  echo "SKIP $TASK: no dataset at $DATA"
+                  continue
+                fi
+                mkdir -p "$OUT"
+                echo "=== $TASK ctx=$CTX -> $OUT ==="
+                python ruler_matrix.py \
+                  --dataset "$DATA" \
+                  --task "$TASK" \
+                  --output-dir "$OUT" \
+                  --max-input-tokens "$CTX" \
+                  --max-examples "$EXAMPLES" \
+                  --diagnostic-sample-cap 200000 \
+                  --seed "$SEED" \
+                  --dtype "$DTYPE" \
+                  --methods "$METHODS"
+                cat "$OUT/summary.csv"
+                echo "=== $TASK paired offset comparison ==="
+                python compare_offsets.py --results "$OUT" --out-dir "$OUT/offset_summary"
+              done
+
+              echo "=== all tasks done ==="
+          env:
+            - name: SANTA_CTX
+              value: "8192"
+            - name: SANTA_SEED
+              value: "1690"
+            - name: SANTA_DTYPE
+              value: "auto"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+            - name: HF_HOME
+              value: /tmp/hf
+            - name: TRANSFORMERS_CACHE
+              value: /tmp/hf
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: expandable_segments:True
+          resources:
+            requests:
+              cpu: "1"
+              memory: 12Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4"
+              memory: 24Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: repo
+              mountPath: /repo
+            - name: shared
+              mountPath: /shared
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: repo
+          emptyDir: {}
+        - name: shared
+          persistentVolumeClaim:
+            claimName: kevin-ruler-shared
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi

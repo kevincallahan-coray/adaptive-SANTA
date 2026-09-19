@@ -174,3 +174,22 @@ existing 4K results are not overwritten.
 ## 8K GPU requirement
 
 The instrumented 8K RULER jobs now require **Ampere or newer** (`nvidia.com/gpu.compute.major > 7`) with >20 GB VRAM. This avoids NVIDIA TITAN RTX/Turing nodes, where BF16 SDPA can take a memory-heavy fallback path and OOM at 8K. See `INSTRUMENTED_8K.md`.
+
+## 8K midpoint-offset comparison
+
+Systematic SANTA anchors its threshold grid at a random offset `u ~ U[0,1)`
+per decode head/query. A follow-on run replaces that with a constant `u = 0.5`
+and scores both arms on 8K FWE and NIAH-multivalue, so the accuracy effect of
+the randomization can be separated from the accuracy effect of spreading draws
+over the CDF. Method names take a `-mid` suffix (`fixed64` vs `fixed64-mid`),
+and both arms run in the same pod so the comparison can be paired per example.
+
+```bat
+scripts\run-midpoint.bat         8K
+scripts\run-midpoint.bat 4k      4K, if the 8K node pool is busy
+```
+
+The job asks for one GPU and runs both tasks sequentially inside the pod, on
+the same `compute.major > 6` node pool as the 4K jobs in `k8s/parallel`.
+Results are isolated under `/shared/ruler/results/<ctx>_100_midpoint/`. See
+`MIDPOINT_OFFSET.md`.

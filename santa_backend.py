@@ -26,9 +26,30 @@ DIAGNOSTIC_COLUMNS = (
 DIAGNOSTIC_INDEX = {name: i for i, name in enumerate(DIAGNOSTIC_COLUMNS)}
 
 
+# Where the systematic grid of S equal-mass thresholds is anchored.
+#
+#   random   -- u ~ U[0,1) drawn per decode head/query.  Thresholds
+#               (j + u) * Z / S.  This is systematic sampling proper:
+#               unbiased, with one source of randomness per head/query
+#               regardless of S.
+#   midpoint -- u held at the constant 0.5.  Thresholds (j + 0.5) * Z / S,
+#               i.e. the midpoint of every equal-mass stratum.  No rng is
+#               consumed, the index set is a deterministic function of the
+#               attention weights, the variance across repeats is exactly
+#               zero, and the error is entirely bias.  It is the midpoint
+#               quadrature rule on the inverse CDF, not a sampler.
+#
+# The grid is identical either way -- draws are still spread evenly over the
+# CDF.  Only the anchoring changes, which separates the two things systematic
+# sampling does: spreading is what reduces error, randomizing the anchor is
+# what buys unbiasedness and the ability to state a confidence interval.
+OFFSET_MODES = ("random", "midpoint")
+
+
 @dataclass
 class SantaConfig:
     mode: str = "dense"              # dense | fixed | adaptive
+    offset: str = "random"           # random | midpoint
     alpha: float = 1.0
     fixed_s: int = 128
     candidates: tuple[int, ...] = (8, 16, 32, 64, 128, 256)
@@ -57,11 +78,19 @@ class SantaController:
         self.dense_equivalent_row_accesses = 0
         self._diagnostic_chunks: list[torch.Tensor] = []
 
-    def configure(self, mode: str, *, alpha=None, fixed_s=None,
+    def configure(self, mode: str, *, offset=None, alpha=None, fixed_s=None,
                   candidates: Sequence[int] | None = None, seed: int = 0):
         if mode not in {"dense", "fixed", "adaptive"}:
             raise ValueError(mode)
         self.config.mode = mode
+        # Offset is a property of the sampler, not of the budget policy, so it
+        # composes with both fixed-S and adaptive-Z.  An omitted offset resets
+        # to "random" so a midpoint method cannot leak into the next method of
+        # a matrix run.
+        offset = "random" if offset is None else str(offset)
+        if offset not in OFFSET_MODES:
+            raise ValueError(f"offset must be one of {OFFSET_MODES}, got {offset!r}")
+        self.config.offset = offset
         if alpha is not None:
             self.config.alpha = float(alpha)
         if fixed_s is not None:
@@ -114,6 +143,7 @@ class SantaController:
         dense_rows = self.dense_equivalent_row_accesses
         total_samples = self.total_samples
         return {
+            "offset": self.config.offset,
             "sampled_head_queries": self.sampled_head_queries,
             "attention_head_queries": n,
             "mean_S": (total_samples / self.sampled_head_queries) if self.sampled_head_queries else None,
@@ -154,7 +184,13 @@ def _select_s(z: torch.Tensor) -> torch.Tensor:
 
 def santa_attention_forward(module, query, key, value, attention_mask, scaling,
                             dropout=0.0, **kwargs):
-    """Dense SDPA for prefill; systematic SANTA only for q_len==1 decode."""
+    """Dense SDPA for prefill; systematic SANTA only for q_len==1 decode.
+
+    The threshold grid is the same in both offset modes; only where it is
+    anchored differs (see ``OFFSET_MODES``).  The registered backend name
+    stays ``santa_systematic`` because the mechanism is unchanged -- a
+    midpoint run is still a systematic grid, just not a randomized one.
+    """
     from transformers.integrations.sdpa_attention import sdpa_attention_forward
 
     cfg = CONTROLLER.config
@@ -215,7 +251,12 @@ def santa_attention_forward(module, query, key, value, attention_mask, scaling,
         if rows.numel() == 0:
             continue
         count = rows.numel()
-        u = torch.rand((count,1), device=weights.device, generator=gen, dtype=torch.float32)
+        if cfg.offset == "midpoint":
+            # Deterministic: the generator is not touched, so the seed never
+            # reaches the sampler and repeated runs return the same indices.
+            u = torch.full((count,1), 0.5, device=weights.device, dtype=torch.float32)
+        else:
+            u = torch.rand((count,1), device=weights.device, generator=gen, dtype=torch.float32)
         j = torch.arange(s, device=weights.device, dtype=torch.float32).unsqueeze(0)
         thresholds = (j + u) * (z_f[rows].unsqueeze(1) / float(s))
         idx = torch.searchsorted(cdf_f[rows], thresholds, right=True).clamp_max(k-1)

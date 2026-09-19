@@ -15,7 +15,18 @@ from ruler_metrics import score_records
 from santa_backend import CONTROLLER, DIAGNOSTIC_COLUMNS, DIAGNOSTIC_INDEX, register_backend
 
 TASK_TOKENS = {"fwe": 50, "niah_multivalue": 128, "qa_1": 32, "qa_2": 32}
+# Appended to a method name to swap systematic sampling's random offset for a
+# constant 0.5.  See parse_method and santa_backend.OFFSET_MODES.
+OFFSET_SUFFIX = "-mid"
 DEFAULT_METHODS = "dense,fixed8,fixed16,fixed32,fixed64,fixed128,fixed256,adaptive4,adaptive8,adaptive16,adaptive32"
+# Both offset arms over the same budgets, interleaved so a job killed part way
+# through still leaves matched pairs rather than a complete random arm with
+# nothing to compare it against.
+OFFSET_PAIRED_METHODS = (
+    "dense,"
+    "fixed8,fixed8-mid,fixed16,fixed16-mid,fixed32,fixed32-mid,"
+    "fixed64,fixed64-mid,fixed128,fixed128-mid,fixed256,fixed256-mid"
+)
 PERCENTILES = (10, 25, 50, 75, 90, 95, 99)
 
 
@@ -25,13 +36,23 @@ def parse_args():
     p.add_argument("--task", choices=sorted(TASK_TOKENS), required=True)
     p.add_argument("--output-dir", required=True)
     p.add_argument("--model", default="meta-llama/Meta-Llama-3.1-8B-Instruct")
-    p.add_argument("--methods", default=DEFAULT_METHODS)
+    p.add_argument("--methods", default=DEFAULT_METHODS,
+                   help="Comma-separated method names. Append '-mid' to run that "
+                        "method with a constant 0.5 systematic offset instead of a "
+                        "random one, e.g. 'fixed64,fixed64-mid'. The paired offset "
+                        f"sweep is: {OFFSET_PAIRED_METHODS}")
     p.add_argument("--candidates", default="8,16,32,64,128,256",
                    help="Comma-separated allowed S values used by fixed/adaptive sampling")
     p.add_argument("--max-examples", type=int, default=10)
     p.add_argument("--max-input-tokens", type=int, default=4096)
     p.add_argument("--max-new-tokens", type=int, default=None)
     p.add_argument("--seed", type=int, default=1690)
+    p.add_argument("--dtype", default="auto", choices=["auto", "bfloat16", "float16"],
+                   help="Model dtype. 'auto' picks bfloat16 where the GPU supports it "
+                        "and float16 otherwise, which is what lets this run on Turing. "
+                        "Both offset arms share one dtype because they share a process, "
+                        "so a paired comparison stays valid either way -- but numbers "
+                        "from a float16 run are NOT comparable across runs to bfloat16 ones.")
     p.add_argument("--diagnostic-sample-cap", type=int, default=None,
                    help="Maximum synchronized attention-event rows retained per method")
     p.add_argument("--z-sample-cap", type=int, default=200000,
@@ -40,16 +61,51 @@ def parse_args():
 
 
 def parse_method(name):
-    name = name.strip().lower()
-    if name == "dense":
-        return name, "dense", None, None
-    if name.startswith("fixed"):
-        s = int(name[len("fixed"):])
-        return name, "fixed", None, s
-    if name.startswith("adaptive"):
-        alpha = float(name[len("adaptive"):])
-        return name, "adaptive", alpha, None
+    """`fixed64` -> randomized systematic; `fixed64-mid` -> constant 0.5 offset.
+
+    The suffix selects the sampler's offset mode and is orthogonal to the
+    budget policy, so `adaptive8-mid` is legal too. The full label including
+    the suffix is returned, so output files and CSV rows stay distinct between
+    the two arms and both can sit in one `summary.csv`.
+
+    The suffix is `-mid` and not `-fixed` because "fixed" is already taken:
+    `fixedS` is a fixed sample *budget*, and `fixed64-fixed` would be
+    unreadable.
+    """
+    label = name.strip().lower()
+    body = label
+    offset = "random"
+    if body.endswith(OFFSET_SUFFIX):
+        body = body[: -len(OFFSET_SUFFIX)]
+        offset = "midpoint"
+    if body == "dense":
+        if offset != "random":
+            raise ValueError("dense decode does not sample, so '-mid' is meaningless on it")
+        return label, "dense", None, None, None
+    if body.startswith("fixed"):
+        s = int(body[len("fixed"):])
+        return label, "fixed", None, s, offset
+    if body.startswith("adaptive"):
+        alpha = float(body[len("adaptive"):])
+        return label, "adaptive", alpha, None, offset
     raise ValueError(f"Unknown method: {name}")
+
+
+def resolve_dtype(name):
+    """Pick the model dtype, falling back off bfloat16 on pre-Ampere GPUs.
+
+    Turing (compute 7.x) has no native bfloat16, and on that path an 8K BF16
+    prefill can drop into a much more memory-hungry SDPA fallback and OOM a
+    24 GiB card. float16 keeps it on the efficient path. The cost is that
+    float16 numbers cannot be lined up against bfloat16 numbers from another
+    run; within one process both offset arms see the same dtype, so the paired
+    comparison this experiment exists for is unaffected.
+    """
+    if name == "bfloat16":
+        return torch.bfloat16
+    if name == "float16":
+        return torch.float16
+    return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
 
 def parse_candidates(text):
@@ -235,11 +291,15 @@ def main():
         raise ValueError("Dataset is empty")
 
     register_backend()
+    dtype = resolve_dtype(args.dtype)
+    print(f"model dtype: {dtype} (--dtype {args.dtype}); "
+          f"gpu={torch.cuda.get_device_name(0)} cc={torch.cuda.get_device_capability(0)}",
+          flush=True)
     tok = AutoTokenizer.from_pretrained(args.model, token=os.getenv("HF_TOKEN"))
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         token=os.getenv("HF_TOKEN"),
-        torch_dtype=torch.bfloat16,
+        torch_dtype=dtype,
         attn_implementation="santa_systematic",
         low_cpu_mem_usage=True,
     ).cuda().eval()
@@ -248,9 +308,10 @@ def main():
     summaries = []
 
     for method_index, method_text in enumerate(args.methods.split(",")):
-        method, mode, alpha, fixed_s = parse_method(method_text)
+        method, mode, alpha, fixed_s, offset = parse_method(method_text)
         CONTROLLER.configure(
             mode,
+            offset=offset,
             alpha=1.0 if alpha is None else alpha,
             fixed_s=128 if fixed_s is None else fixed_s,
             candidates=candidates,
@@ -306,6 +367,7 @@ def main():
                     "generation": pred,
                     "method": method,
                     "mode": mode,
+                    "offset": offset,
                     "alpha": alpha,
                     "fixed_s": fixed_s,
                     "seed": args.seed,
@@ -339,6 +401,8 @@ def main():
             "task": args.task,
             "method": method,
             "mode": mode,
+            "offset": offset,
+            "dtype": str(dtype).replace("torch.", ""),
             "alpha": alpha,
             "fixed_s": fixed_s,
             "candidates": ",".join(str(x) for x in candidates),
